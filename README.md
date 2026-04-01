@@ -46,6 +46,7 @@ Optional URL mode controls:
 - `--retries` retry count for transient failures (default: `2`)
 - `--max-requests` hard cap to prevent runaway crawling (default: `10000`)
 - `--max-redirects` maximum safe redirects to follow per request (default: `5`)
+- `--no-unsafe-redirect-probe` disable fallback probing of `<path>/.DS_Store` when unsafe redirects are blocked
 - `--log-level` logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`)
 
 Example:
@@ -84,6 +85,7 @@ ds-store-recovery \
 - `.DS_Store` does not contain full file contents, only metadata and names.
 - URL mode can only download files that are directly accessible over HTTP(S).
 - URL mode intentionally blocks redirects that change hostnames, redirect to raw IP hosts, or downgrade HTTPS to HTTP.
+- When an unsafe redirect is blocked for a likely directory path, URL mode queues a same-host fallback probe for `<path>/.DS_Store` (disable with `--no-unsafe-redirect-probe`).
 - Local mode can only copy file contents when those files actually exist in the local source directory.
 - Some `.DS_Store` internals rely on library behavior and can vary across macOS versions.
 

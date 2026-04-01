@@ -64,6 +64,16 @@ def should_probe_child_ds_store(parts):
     return "." not in name
 
 
+def looks_like_directory_path(path):
+    clean = (path or "").strip()
+    if not clean or clean == "/":
+        return True
+    if clean.endswith("/"):
+        return True
+    name = clean.rstrip("/").split("/")[-1]
+    return "." not in name
+
+
 class ColorFormatter(logging.Formatter):
     RESET = "\033[0m"
     COLORS = {
@@ -107,6 +117,7 @@ class URLRecovery(object):
         retries=2,
         max_requests=10000,
         max_redirects=5,
+        enable_unsafe_redirect_probe=True,
         ds_store_parser=parse_ds_store_names,
     ):
         self.start_url = normalize_url(start_url)
@@ -116,17 +127,21 @@ class URLRecovery(object):
         self.retries = retries
         self.max_requests = max_requests
         self.max_redirects = max_redirects
+        self.enable_unsafe_redirect_probe = enable_unsafe_redirect_probe
         self.ds_store_parser = ds_store_parser
 
         self.queue = queue.Queue()
-        self.queue.put(self.start_url)
         self.processed_url = set()
         self.active_workers = 0
         self.lock = threading.Lock()
+        self.enqueued_url = set()
+        self.queue_entry_count = 0
         self.total_requests = 0
         self.total_downloaded = 0
         self.total_errors = 0
         self.stop_requested = False
+
+        self._enqueue_url(self.start_url, reason="initial")
 
         self.session = requests.Session()
         retry_cfg = Retry(
@@ -174,9 +189,43 @@ class URLRecovery(object):
 
             normalized_name = "/".join(parts)
             child_url = urljoin(base_url, normalized_name)
-            self.queue.put(child_url)
+            self._enqueue_url(child_url, reason="ds-store-entry")
             if should_probe_child_ds_store(parts):
-                self.queue.put(urljoin(base_url, normalized_name.rstrip("/") + "/.DS_Store"))
+                self._enqueue_url(
+                    urljoin(base_url, normalized_name.rstrip("/") + "/.DS_Store"),
+                    reason="ds-store-child-probe",
+                )
+
+    def _enqueue_url(self, url, reason="", display_path=None):
+        with self.lock:
+            if url in self.processed_url or url in self.enqueued_url:
+                return False
+            self.enqueued_url.add(url)
+            self.queue_entry_count += 1
+            entry_no = self.queue_entry_count
+        self.queue.put(url)
+        path = display_path or (urlparse(url).path or "/")
+        if reason:
+            LOG.info("[QUEUE-ENTRY-%d] %s added to queue (%s)", entry_no, path, reason)
+        else:
+            LOG.info("[QUEUE-ENTRY-%d] %s added to queue", entry_no, path)
+        return True
+
+    def _enqueue_blocked_redirect_probe(self, source_url):
+        parsed = urlparse(source_url)
+        if parsed.path.lower().endswith(".ds_store"):
+            return
+        if not looks_like_directory_path(parsed.path):
+            return
+        probe_path = parsed.path.rstrip("/") + "/.DS_Store"
+        if not probe_path.startswith("/"):
+            probe_path = "/" + probe_path
+        probe_url = parsed._replace(path=probe_path, params="", query="", fragment="").geturl()
+        self._enqueue_url(
+            probe_url,
+            reason="unsafe-redirect-probe",
+            display_path=(parsed.path or "/"),
+        )
 
     def _is_safe_redirect(self, old_url, new_url):
         old = urlparse(old_url)
@@ -196,16 +245,16 @@ class URLRecovery(object):
             if response.is_redirect or response.is_permanent_redirect:
                 location = response.headers.get("Location")
                 if not location:
-                    return response
+                    return response, False, None
                 target = urljoin(current, location)
                 if not self._is_safe_redirect(current, target):
                     LOG.warning("Blocked unsafe redirect: %s -> %s", current, target)
-                    return response
+                    return response, True, current
                 current = target
                 continue
-            return response
+            return response, False, None
         LOG.warning("Redirect limit reached for %s", url)
-        return response
+        return response, False, None
 
     def _write_response_content(self, parsed_url, content):
         target_path = self._safe_output_path(parsed_url.netloc, parsed_url.path)
@@ -254,10 +303,17 @@ class URLRecovery(object):
                     self.processed_url.add(url)
                     self.total_requests += 1
 
-                response = self._get_with_safe_redirects(url)
+                response, blocked_unsafe_redirect, blocked_from_url = self._get_with_safe_redirects(url)
                 status = response.status_code
                 final_url = response.url
                 LOG.info("[%s] %s", status, final_url)
+
+                if (
+                    blocked_unsafe_redirect
+                    and blocked_from_url
+                    and self.enable_unsafe_redirect_probe
+                ):
+                    self._enqueue_blocked_redirect_probe(blocked_from_url)
 
                 if status != 200:
                     continue
@@ -433,6 +489,11 @@ def parse_args(argv=None):
         help="Maximum safe redirects to follow for each request (default: 5)",
     )
     parser.add_argument(
+        "--no-unsafe-redirect-probe",
+        action="store_true",
+        help="Disable fallback queueing of <path>/.DS_Store after blocked unsafe redirects",
+    )
+    parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         default="INFO",
@@ -459,6 +520,7 @@ def main(argv=None):
                 retries=max(0, args.retries),
                 max_requests=max(1, args.max_requests),
                 max_redirects=max(0, args.max_redirects),
+                enable_unsafe_redirect_probe=not args.no_unsafe_redirect_probe,
             )
             runner.run()
             return 0

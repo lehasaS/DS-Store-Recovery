@@ -136,12 +136,55 @@ def test_should_probe_child_ds_store_heuristic():
     assert not mod.should_probe_child_ds_store(["index.php"])
 
 
+def test_looks_like_directory_path_heuristic():
+    assert mod.looks_like_directory_path("/wp-content")
+    assert mod.looks_like_directory_path("/wp-content/")
+    assert mod.looks_like_directory_path("/")
+    assert not mod.looks_like_directory_path("/index.php")
+
+
 def test_url_recovery_blocks_unsafe_redirect_to_ip(tmp_path):
     rec = mod.URLRecovery("https://example.com/.DS_Store", tmp_path)
     assert not rec._is_safe_redirect(
         "https://example.com/wp-content",
         "http://173.33.150.140/loop-web/wp-content/",
     )
+
+
+def test_unsafe_redirect_probe_is_enqueued(tmp_path):
+    rec = mod.URLRecovery("https://example.com/.DS_Store", tmp_path)
+    rec._enqueue_blocked_redirect_probe("https://example.com/wp-includes")
+
+    assert "https://example.com/wp-includes/.DS_Store" in rec.enqueued_url
+
+
+def test_unsafe_redirect_probe_skips_file_like_path(tmp_path):
+    rec = mod.URLRecovery("https://example.com/.DS_Store", tmp_path)
+    rec._enqueue_blocked_redirect_probe("https://example.com/index.php")
+
+    assert "https://example.com/index.php/.DS_Store" not in rec.enqueued_url
+
+
+def test_enqueue_url_deduplicates_entries(tmp_path):
+    rec = mod.URLRecovery("https://example.com/.DS_Store", tmp_path)
+    first = rec._enqueue_url("https://example.com/wp-content/.DS_Store", reason="test")
+    second = rec._enqueue_url("https://example.com/wp-content/.DS_Store", reason="test")
+
+    assert first is True
+    assert second is False
+
+
+def test_parse_args_supports_disabling_unsafe_redirect_probe():
+    args = mod.parse_args(
+        [
+            "--url",
+            "example.com/.DS_Store",
+            "--output",
+            "./out",
+            "--no-unsafe-redirect-probe",
+        ]
+    )
+    assert args.no_unsafe_redirect_probe is True
 
 
 def test_write_response_skips_when_target_is_existing_directory(tmp_path):
