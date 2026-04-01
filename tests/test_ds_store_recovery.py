@@ -70,10 +70,13 @@ def test_url_recovery_safe_output_path_blocks_escape(tmp_path):
 
 
 class _FakeResponse:
-    def __init__(self, status_code, url, content):
+    def __init__(self, status_code, url, content, headers=None):
         self.status_code = status_code
         self.url = url
         self.content = content
+        self.headers = headers or {}
+        self.is_redirect = False
+        self.is_permanent_redirect = False
 
 
 class _FakeSession:
@@ -126,3 +129,26 @@ def test_parse_args_includes_new_flags():
     assert args.url == "example.com/.DS_Store"
     assert args.max_requests == 50
     assert args.log_level == "DEBUG"
+
+
+def test_should_probe_child_ds_store_heuristic():
+    assert mod.should_probe_child_ds_store(["wp-content"])
+    assert not mod.should_probe_child_ds_store(["index.php"])
+
+
+def test_url_recovery_blocks_unsafe_redirect_to_ip(tmp_path):
+    rec = mod.URLRecovery("https://example.com/.DS_Store", tmp_path)
+    assert not rec._is_safe_redirect(
+        "https://example.com/wp-content",
+        "http://173.33.150.140/loop-web/wp-content/",
+    )
+
+
+def test_write_response_skips_when_target_is_existing_directory(tmp_path):
+    rec = mod.URLRecovery("http://example.com/.DS_Store", tmp_path)
+    target_dir = tmp_path / "example.com" / "loop-web" / "index.php"
+    target_dir.mkdir(parents=True)
+    parsed = mod.urlparse("http://example.com/loop-web/index.php")
+
+    wrote = rec._write_response_content(parsed, b"abc")
+    assert not wrote

@@ -45,6 +45,7 @@ Optional URL mode controls:
 - `--timeout` per-request timeout in seconds (default: `10`)
 - `--retries` retry count for transient failures (default: `2`)
 - `--max-requests` hard cap to prevent runaway crawling (default: `10000`)
+- `--max-redirects` maximum safe redirects to follow per request (default: `5`)
 - `--log-level` logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`)
 
 Example:
@@ -57,6 +58,7 @@ ds-store-recovery \
   --timeout 15 \
   --retries 3 \
   --max-requests 5000 \
+  --max-redirects 5 \
   --log-level INFO
 ```
 
@@ -64,7 +66,7 @@ ds-store-recovery \
 
 ```bash
 ds-store-recovery \
-  --local ~/Documents/TestingNotes/HTTP \
+  --local /path/to/source-dir \
   --output ./recovered-local
 ```
 
@@ -72,7 +74,7 @@ By default, if `.DS_Store` lists a file name but the actual local file is missin
 
 ```bash
 ds-store-recovery \
-  --local ~/Documents/TestingNotes/HTTP \
+  --local /path/to/source-dir \
   --output ./recovered-local \
   --no-placeholders
 ```
@@ -81,6 +83,7 @@ ds-store-recovery \
 
 - `.DS_Store` does not contain full file contents, only metadata and names.
 - URL mode can only download files that are directly accessible over HTTP(S).
+- URL mode intentionally blocks redirects that change hostnames, redirect to raw IP hosts, or downgrade HTTPS to HTTP.
 - Local mode can only copy file contents when those files actually exist in the local source directory.
 - Some `.DS_Store` internals rely on library behavior and can vary across macOS versions.
 

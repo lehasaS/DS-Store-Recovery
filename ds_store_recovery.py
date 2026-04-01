@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import logging
+import ipaddress
 import queue
 import shutil
 import sys
@@ -47,6 +48,40 @@ def is_within_root(root, path):
         return False
 
 
+def is_ip_hostname(hostname):
+    if not hostname:
+        return False
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        return False
+
+
+def should_probe_child_ds_store(parts):
+    # Heuristic: only probe nested .DS_Store for likely directory entries.
+    name = parts[-1]
+    return "." not in name
+
+
+class ColorFormatter(logging.Formatter):
+    RESET = "\033[0m"
+    COLORS = {
+        "DEBUG": "\033[36m",
+        "INFO": "\033[32m",
+        "WARNING": "\033[33m",
+        "ERROR": "\033[31m",
+        "CRITICAL": "\033[35m",
+    }
+
+    def format(self, record):
+        message = super().format(record)
+        color = self.COLORS.get(record.levelname, "")
+        if not color:
+            return message
+        return "%s%s%s" % (color, message, self.RESET)
+
+
 def safe_ds_entry_parts(entry_name):
     if not entry_name or entry_name == ".":
         return None
@@ -71,6 +106,7 @@ class URLRecovery(object):
         timeout=10,
         retries=2,
         max_requests=10000,
+        max_redirects=5,
         ds_store_parser=parse_ds_store_names,
     ):
         self.start_url = normalize_url(start_url)
@@ -79,6 +115,7 @@ class URLRecovery(object):
         self.timeout = timeout
         self.retries = retries
         self.max_requests = max_requests
+        self.max_redirects = max_redirects
         self.ds_store_parser = ds_store_parser
 
         self.queue = queue.Queue()
@@ -124,7 +161,11 @@ class URLRecovery(object):
         return url
 
     def _parse_and_enqueue_from_ds_store(self, ds_store_bytes, base_url):
-        names = self.ds_store_parser(ds_store_bytes)
+        try:
+            names = self.ds_store_parser(ds_store_bytes)
+        except Exception as exc:
+            LOG.warning("Skipping invalid .DS_Store content at %s (%s)", base_url, exc)
+            return
 
         for name in names:
             parts = safe_ds_entry_parts(name)
@@ -134,7 +175,54 @@ class URLRecovery(object):
             normalized_name = "/".join(parts)
             child_url = urljoin(base_url, normalized_name)
             self.queue.put(child_url)
-            self.queue.put(urljoin(base_url, normalized_name.rstrip("/") + "/.DS_Store"))
+            if should_probe_child_ds_store(parts):
+                self.queue.put(urljoin(base_url, normalized_name.rstrip("/") + "/.DS_Store"))
+
+    def _is_safe_redirect(self, old_url, new_url):
+        old = urlparse(old_url)
+        new = urlparse(new_url)
+        if old.hostname != new.hostname:
+            return False
+        if is_ip_hostname(new.hostname):
+            return False
+        if old.scheme == "https" and new.scheme != "https":
+            return False
+        return True
+
+    def _get_with_safe_redirects(self, url):
+        current = url
+        for _ in range(self.max_redirects + 1):
+            response = self.session.get(current, allow_redirects=False, timeout=self.timeout)
+            if response.is_redirect or response.is_permanent_redirect:
+                location = response.headers.get("Location")
+                if not location:
+                    return response
+                target = urljoin(current, location)
+                if not self._is_safe_redirect(current, target):
+                    LOG.warning("Blocked unsafe redirect: %s -> %s", current, target)
+                    return response
+                current = target
+                continue
+            return response
+        LOG.warning("Redirect limit reached for %s", url)
+        return response
+
+    def _write_response_content(self, parsed_url, content):
+        target_path = self._safe_output_path(parsed_url.netloc, parsed_url.path)
+        parent = target_path.parent
+
+        if parent.exists() and not parent.is_dir():
+            LOG.warning("Skipping write due to file/dir collision (parent is file): %s", parent)
+            return False
+
+        parent.mkdir(parents=True, exist_ok=True)
+
+        if target_path.exists() and target_path.is_dir():
+            LOG.warning("Skipping write due to file/dir collision (target is dir): %s", target_path)
+            return False
+
+        target_path.write_bytes(content)
+        return True
 
     def _worker(self):
         while True:
@@ -166,7 +254,7 @@ class URLRecovery(object):
                     self.processed_url.add(url)
                     self.total_requests += 1
 
-                response = self.session.get(url, allow_redirects=True, timeout=self.timeout)
+                response = self._get_with_safe_redirects(url)
                 status = response.status_code
                 final_url = response.url
                 LOG.info("[%s] %s", status, final_url)
@@ -175,9 +263,9 @@ class URLRecovery(object):
                     continue
 
                 parsed = urlparse(final_url)
-                target_path = self._safe_output_path(parsed.netloc, parsed.path)
-                target_path.parent.mkdir(parents=True, exist_ok=True)
-                target_path.write_bytes(response.content)
+                wrote = self._write_response_content(parsed, response.content)
+                if not wrote:
+                    continue
                 with self.lock:
                     self.total_downloaded += 1
 
@@ -339,6 +427,12 @@ def parse_args(argv=None):
         help="Maximum HTTP requests in URL mode before stopping (default: 10000)",
     )
     parser.add_argument(
+        "--max-redirects",
+        type=int,
+        default=5,
+        help="Maximum safe redirects to follow for each request (default: 5)",
+    )
+    parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         default="INFO",
@@ -349,7 +443,11 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s %(message)s")
+    handler = logging.StreamHandler()
+    handler.setFormatter(ColorFormatter("%(levelname)s %(message)s"))
+    LOG.handlers = [handler]
+    LOG.setLevel(getattr(logging, args.log_level))
+    LOG.propagate = False
 
     try:
         if args.url:
@@ -360,6 +458,7 @@ def main(argv=None):
                 timeout=max(1, args.timeout),
                 retries=max(0, args.retries),
                 max_requests=max(1, args.max_requests),
+                max_redirects=max(0, args.max_redirects),
             )
             runner.run()
             return 0
