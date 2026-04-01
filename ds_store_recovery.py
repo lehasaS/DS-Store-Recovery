@@ -20,6 +20,23 @@ from urllib3.util.retry import Retry
 
 LOG = logging.getLogger("ds_store_recovery")
 
+def banner():
+    banner = r"""
+     ____  ____    ____  _                   
+    |  _ \/ ___|  / ___|| |_ ___  _ __ ___   
+    | | | \___ \  \___ \| __/ _ \| '__/ _ \  
+    | |_| |___) |  ___) | || (_) | | |  __/  
+    |____/|____/  |____/ \__\___/|_|  \___|  
+    |  _ \ ___  ___ _____   _____ _ __ _   _ 
+    | |_) / _ \/ __/ _ \ \ / / _ \ '__| | | |
+    |  _ <  __/ (_| (_) \ V /  __/ |  | |_| |
+    |_| \_\___|\___\___/ \_/ \___|_|   \__, |
+                                        |___/ 
+                                    By 0xHasi
+                """
+    return banner
+
+
 
 def normalize_url(url):
     if not url.lower().startswith(("http://", "https://")):
@@ -61,7 +78,34 @@ def is_ip_hostname(hostname):
 def should_probe_child_ds_store(parts):
     # Heuristic: only probe nested .DS_Store for likely directory entries.
     name = parts[-1]
+    if name.lower() == ".ds_store":
+        return False
+    if name.startswith("._") and len(name) > 2:
+        # AppleDouble sidecars may correspond to real entries (files or dirs).
+        name = name[2:]
+    if name.startswith("."):
+        return True
     return "." not in name
+
+
+def decode_appledouble_name(name):
+    if name.startswith("._") and len(name) > 2:
+        return name[2:]
+    return None
+
+
+def has_likely_file_extension(name):
+    if "." not in name:
+        return False
+    if name.startswith(".") and name.count(".") == 1:
+        # Hidden names like .well-known are often directories in web roots.
+        return False
+    suffix = name.rsplit(".", 1)[1]
+    if not (1 <= len(suffix) <= 5):
+        return False
+    if not suffix.isalnum():
+        return False
+    return any(c.isalpha() for c in suffix)
 
 
 def looks_like_directory_path(path):
@@ -71,7 +115,26 @@ def looks_like_directory_path(path):
     if clean.endswith("/"):
         return True
     name = clean.rstrip("/").split("/")[-1]
-    return "." not in name
+    if name.startswith(".") and name.lower() != ".ds_store":
+        return True
+    return not has_likely_file_extension(name)
+
+
+def url_traversal_depth(url):
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    parts = [p for p in path.split("/") if p]
+    if parts and parts[-1].lower() == ".ds_store":
+        parts = parts[:-1]
+    return len(parts)
+
+
+def iter_entry_variants(parts):
+    yield parts, "raw"
+
+    decoded_leaf = decode_appledouble_name(parts[-1])
+    if decoded_leaf:
+        yield parts[:-1] + [decoded_leaf], "appledouble-decoded"
 
 
 class ColorFormatter(logging.Formatter):
@@ -140,6 +203,10 @@ class URLRecovery(object):
         self.total_downloaded = 0
         self.total_errors = 0
         self.stop_requested = False
+        self.pending_by_depth = {}
+        self.active_by_depth = {}
+        self.seen_depths = set()
+        self.completed_levels = set()
 
         self._enqueue_url(self.start_url, reason="initial")
 
@@ -177,39 +244,107 @@ class URLRecovery(object):
 
     def _parse_and_enqueue_from_ds_store(self, ds_store_bytes, base_url):
         try:
-            names = self.ds_store_parser(ds_store_bytes)
+            names = list(self.ds_store_parser(ds_store_bytes))
         except Exception as exc:
             LOG.warning("Skipping invalid .DS_Store content at %s (%s)", base_url, exc)
             return
 
+        enqueued_count = 0
         for name in names:
             parts = safe_ds_entry_parts(name)
             if not parts:
                 continue
 
-            normalized_name = "/".join(parts)
-            child_url = urljoin(base_url, normalized_name)
-            self._enqueue_url(child_url, reason="ds-store-entry")
-            if should_probe_child_ds_store(parts):
+            for candidate_parts, variant in iter_entry_variants(parts):
+                normalized_name = "/".join(candidate_parts)
+                child_url = urljoin(base_url, normalized_name)
+                reason = "ds-store-entry"
+                if variant != "raw":
+                    reason = "%s:%s" % (reason, variant)
+                if self._enqueue_url(child_url, reason=reason):
+                    enqueued_count += 1
+
+                # The decoded candidate is the useful probe target for AppleDouble entries.
+                if variant == "raw" and parts[-1].startswith("._"):
+                    continue
+
+                if not should_probe_child_ds_store(candidate_parts):
+                    continue
                 self._enqueue_url(
                     urljoin(base_url, normalized_name.rstrip("/") + "/.DS_Store"),
                     reason="ds-store-child-probe",
                 )
 
+        LOG.info(
+            "Parsed .DS_Store %s: entries=%d queued=%d",
+            urlparse(base_url).path or "/",
+            len(names),
+            enqueued_count,
+        )
+
     def _enqueue_url(self, url, reason="", display_path=None):
+        depth = url_traversal_depth(url)
         with self.lock:
             if url in self.processed_url or url in self.enqueued_url:
                 return False
             self.enqueued_url.add(url)
             self.queue_entry_count += 1
             entry_no = self.queue_entry_count
-        self.queue.put(url)
+            self.pending_by_depth[depth] = self.pending_by_depth.get(depth, 0) + 1
+            self.seen_depths.add(depth)
+            self.completed_levels.discard(depth)
+            pending_total = sum(self.pending_by_depth.values())
+            active_total = self.active_workers
+
+        self.queue.put((url, depth))
         path = display_path or (urlparse(url).path or "/")
         if reason:
-            LOG.info("[QUEUE-ENTRY-%d] %s added to queue (%s)", entry_no, path, reason)
+            LOG.info(
+                "[LEVEL-%d][QUEUE-ENTRY-%d] %s added to queue (%s) [pending=%d active=%d]",
+                depth,
+                entry_no,
+                path,
+                reason,
+                pending_total,
+                active_total,
+            )
         else:
-            LOG.info("[QUEUE-ENTRY-%d] %s added to queue", entry_no, path)
+            LOG.info(
+                "[LEVEL-%d][QUEUE-ENTRY-%d] %s added to queue [pending=%d active=%d]",
+                depth,
+                entry_no,
+                path,
+                pending_total,
+                active_total,
+            )
         return True
+
+    def _mark_completed_levels_unlocked(self):
+        for depth in sorted(self.seen_depths):
+            if depth in self.completed_levels:
+                continue
+
+            if self.pending_by_depth.get(depth, 0) > 0 or self.active_by_depth.get(depth, 0) > 0:
+                continue
+
+            lower_busy = False
+            for lower in range(depth):
+                if self.pending_by_depth.get(lower, 0) > 0 or self.active_by_depth.get(lower, 0) > 0:
+                    lower_busy = True
+                    break
+            if lower_busy:
+                continue
+
+            self.completed_levels.add(depth)
+            next_levels = sorted(d for d, n in self.pending_by_depth.items() if n > 0)
+            if next_levels:
+                LOG.info(
+                    "[LEVEL-%d-COMPLETE] Next queued depth=%d",
+                    depth,
+                    next_levels[0],
+                )
+            else:
+                LOG.info("[LEVEL-%d-COMPLETE] Queue is currently empty", depth)
 
     def _enqueue_blocked_redirect_probe(self, source_url):
         parsed = urlparse(source_url)
@@ -277,8 +412,10 @@ class URLRecovery(object):
         while True:
             if self.stop_requested:
                 break
+
+            depth = None
             try:
-                url = self.queue.get(timeout=1.0)
+                url, depth = self.queue.get(timeout=1.0)
             except queue.Empty:
                 with self.lock:
                     should_exit = self.active_workers == 0 and self.queue.empty()
@@ -287,7 +424,23 @@ class URLRecovery(object):
                 continue
 
             with self.lock:
+                pending = self.pending_by_depth.get(depth, 0)
+                if pending <= 1:
+                    self.pending_by_depth.pop(depth, None)
+                else:
+                    self.pending_by_depth[depth] = pending - 1
                 self.active_workers += 1
+                self.active_by_depth[depth] = self.active_by_depth.get(depth, 0) + 1
+                pending_total = sum(self.pending_by_depth.values())
+                active_total = self.active_workers
+
+            LOG.info(
+                "[LEVEL-%d][DEQUEUE] %s [pending=%d active=%d]",
+                depth,
+                urlparse(url).path or "/",
+                pending_total,
+                active_total,
+            )
 
             try:
                 with self.lock:
@@ -306,7 +459,7 @@ class URLRecovery(object):
                 response, blocked_unsafe_redirect, blocked_from_url = self._get_with_safe_redirects(url)
                 status = response.status_code
                 final_url = response.url
-                LOG.info("[%s] %s", status, final_url)
+                LOG.info("[LEVEL-%d][%s] %s", depth, status, final_url)
 
                 if (
                     blocked_unsafe_redirect
@@ -330,12 +483,19 @@ class URLRecovery(object):
                     self._parse_and_enqueue_from_ds_store(response.content, base_url)
 
             except Exception as exc:
-                LOG.error("Worker error: %s", exc)
+                LOG.error("[LEVEL-%d] Worker error: %s", depth if depth is not None else -1, exc)
                 with self.lock:
                     self.total_errors += 1
             finally:
                 with self.lock:
                     self.active_workers -= 1
+                    if depth is not None:
+                        active = self.active_by_depth.get(depth, 0)
+                        if active <= 1:
+                            self.active_by_depth.pop(depth, None)
+                        else:
+                            self.active_by_depth[depth] = active - 1
+                    self._mark_completed_levels_unlocked()
                 self.queue.task_done()
 
     def run(self):
@@ -416,8 +576,28 @@ class LocalRecovery(object):
                 src_path = self._src_path_for_entry(ds_path, parts)
 
                 if src_path.is_dir():
+                    if out_path.exists() and not out_path.is_dir():
+                        LOG.warning(
+                            "Skipping directory due to file/dir collision (target is file): %s",
+                            out_path,
+                        )
+                        continue
                     out_path.mkdir(parents=True, exist_ok=True)
                     self.total_dirs += 1
+                    continue
+
+                if out_path.exists() and out_path.is_dir():
+                    LOG.warning(
+                        "Skipping file due to file/dir collision (target is dir): %s",
+                        out_path,
+                    )
+                    continue
+
+                if out_path.parent.exists() and not out_path.parent.is_dir():
+                    LOG.warning(
+                        "Skipping file due to file/dir collision (parent is file): %s",
+                        out_path.parent,
+                    )
                     continue
 
                 out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -503,6 +683,7 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
+    print(banner())
     args = parse_args(argv)
     handler = logging.StreamHandler()
     handler.setFormatter(ColorFormatter("%(levelname)s %(message)s"))

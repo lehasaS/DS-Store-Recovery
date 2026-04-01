@@ -134,12 +134,15 @@ def test_parse_args_includes_new_flags():
 def test_should_probe_child_ds_store_heuristic():
     assert mod.should_probe_child_ds_store(["wp-content"])
     assert not mod.should_probe_child_ds_store(["index.php"])
+    assert mod.should_probe_child_ds_store([".well-known"])
 
 
 def test_looks_like_directory_path_heuristic():
     assert mod.looks_like_directory_path("/wp-content")
     assert mod.looks_like_directory_path("/wp-content/")
     assert mod.looks_like_directory_path("/")
+    assert mod.looks_like_directory_path("/.well-known")
+    assert mod.looks_like_directory_path("/release/v1.0")
     assert not mod.looks_like_directory_path("/index.php")
 
 
@@ -195,3 +198,46 @@ def test_write_response_skips_when_target_is_existing_directory(tmp_path):
 
     wrote = rec._write_response_content(parsed, b"abc")
     assert not wrote
+
+
+def test_url_traversal_depth():
+    assert mod.url_traversal_depth("https://example.com/.DS_Store") == 0
+    assert mod.url_traversal_depth("https://example.com/wp-admin/.DS_Store") == 1
+    assert mod.url_traversal_depth("https://example.com/wp-admin/images") == 2
+
+
+def test_decode_appledouble_name():
+    assert mod.decode_appledouble_name("._images") == "images"
+    assert mod.decode_appledouble_name("images") is None
+
+
+def test_url_recovery_enqueues_decoded_appledouble_variant(tmp_path):
+    def fake_parser(_):
+        return {"._images"}
+
+    rec = mod.URLRecovery(
+        start_url="https://example.com/wp-admin/.DS_Store",
+        output_dir=tmp_path,
+        ds_store_parser=fake_parser,
+    )
+    rec._parse_and_enqueue_from_ds_store(b"dummy", "https://example.com/wp-admin/")
+
+    assert "https://example.com/wp-admin/._images" in rec.enqueued_url
+    assert "https://example.com/wp-admin/images" in rec.enqueued_url
+    assert "https://example.com/wp-admin/images/.DS_Store" in rec.enqueued_url
+
+
+def test_local_recovery_handles_file_dir_collision_without_crash(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    (source / ".DS_Store").write_bytes(b"dummy")
+
+    def fake_parser(_):
+        return ["a", "a/b"]
+
+    rec = mod.LocalRecovery(source, output, create_placeholders=True, ds_store_parser=fake_parser)
+    rec.run()
+
+    assert (output / "a").is_file()
+    assert not (output / "a" / "b").exists()

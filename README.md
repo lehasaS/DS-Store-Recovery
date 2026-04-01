@@ -86,7 +86,10 @@ ds-store-recovery \
 - URL mode can only download files that are directly accessible over HTTP(S).
 - URL mode intentionally blocks redirects that change hostnames, redirect to raw IP hosts, or downgrade HTTPS to HTTP.
 - When an unsafe redirect is blocked for a likely directory path, URL mode queues a same-host fallback probe for `<path>/.DS_Store` (disable with `--no-unsafe-redirect-probe`).
+- URL mode now includes traversal depth in queue/request logs (`LEVEL-n`) and reports when each depth is fully drained, which makes long crawls easier to follow.
+- URL mode treats AppleDouble-style entries (for example `._images`) as likely metadata sidecars and also queues a decoded candidate (`images`) to avoid missing real paths behind ZIP/macOS metadata artifacts.
 - Local mode can only copy file contents when those files actually exist in the local source directory.
+- Local mode avoids crashing on file/directory name collisions and logs those collisions as warnings.
 - Some `.DS_Store` internals rely on library behavior and can vary across macOS versions.
 
 ## Documentation
